@@ -7,6 +7,7 @@ from typing import Iterable, List, Sequence, Tuple
 import math
 import random
 
+import matplotlib.pyplot as plt
 
 @dataclass
 class SwitchingTwoArmBandit:
@@ -60,9 +61,19 @@ class SarsaSoftmaxAgent:
         self.q_values[action] += self.alpha * (target - self.q_values[action])
 
 
-def simulate_agent(environment: SwitchingTwoArmBandit, agent: SarsaSoftmaxAgent) -> Tuple[List[int], List[int]]:
+@dataclass
+class SimulationResult:
+    actions: List[int]
+    rewards: List[int]
+    q_history: List[List[float]]
+
+
+def simulate_agent(
+    environment: SwitchingTwoArmBandit, agent: SarsaSoftmaxAgent
+) -> SimulationResult:
     actions: List[int] = [0] * environment.n_trials
     rewards: List[int] = [0] * environment.n_trials
+    q_history: List[List[float]] = [[0.0] * agent.n_actions for _ in range(environment.n_trials)]
 
     for t in range(environment.n_trials):
         action, _ = agent.select_action()
@@ -71,8 +82,9 @@ def simulate_agent(environment: SwitchingTwoArmBandit, agent: SarsaSoftmaxAgent)
 
         actions[t] = action
         rewards[t] = reward
+        q_history[t] = agent.q_values.copy()
 
-    return actions, rewards
+    return SimulationResult(actions=actions, rewards=rewards, q_history=q_history)
 
 
 def compute_log_likelihood(
@@ -106,10 +118,10 @@ def evaluate_models(
     rewards: Sequence[int],
     alphas: Iterable[float],
     betas: Iterable[float],
-) -> List[Tuple[float, float, float, float]]:
+) -> List[Tuple[float, float, float, float, float]]:
     n_params = 2
     n_samples = len(actions)
-    evaluations: List[Tuple[float, float, float, float]] = []
+    evaluations: List[Tuple[float, float, float, float, float]] = []
 
     for alpha in alphas:
         for beta in betas:
@@ -131,12 +143,13 @@ def main() -> None:
     agent_rng = random.Random(42)
     agent = SarsaSoftmaxAgent(alpha=true_alpha, beta=true_beta, rng=agent_rng)
 
-    actions, rewards = simulate_agent(environment, agent)
+    true_result = simulate_agent(environment, agent)
+    optimal_arms = [environment.optimal_arm(t) for t in range(environment.n_trials)]
 
     alphas = [round(x, 2) for x in [0.1 * i for i in range(1, 10)]]
     betas = [round(1.0 + i, 2) for i in range(10)]
 
-    evaluations = evaluate_models(actions, rewards, alphas, betas)
+    evaluations = evaluate_models(true_result.actions, true_result.rewards, alphas, betas)
 
     best_alpha, best_beta, best_log_like, best_aic, best_bic = evaluations[0]
 
@@ -151,6 +164,94 @@ def main() -> None:
             f"alpha={alpha:.2f}, beta={beta:.2f}, "
             f"logL={log_like:.2f}, AIC={aic:.2f}, BIC={bic:.2f}"
         )
+
+    estimated_environment = SwitchingTwoArmBandit(
+        rng=random.Random(99),
+        n_trials=environment.n_trials,
+        prob_correct=environment.prob_correct,
+        prob_incorrect=environment.prob_incorrect,
+        switch_interval=environment.switch_interval,
+    )
+    estimated_agent = SarsaSoftmaxAgent(
+        alpha=best_alpha,
+        beta=best_beta,
+        rng=random.Random(99),
+    )
+    estimated_result = simulate_agent(estimated_environment, estimated_agent)
+
+    trials = list(range(environment.n_trials))
+
+    fig1, axes = plt.subplots(4, 2, figsize=(14, 10), sharex=True)
+    column_titles = ["True agent", "Estimated agent"]
+    results = [true_result, estimated_result]
+
+    for col, (title, result) in enumerate(zip(column_titles, results)):
+        q0 = [values[0] for values in result.q_history]
+        q1 = [values[1] for values in result.q_history]
+
+        axes[0, col].plot(trials, q0, label="Q(action 0)")
+        axes[0, col].plot(trials, q1, label="Q(action 1)")
+        axes[0, col].set_ylabel("Action value")
+        axes[0, col].set_title(title)
+        axes[0, col].legend(loc="upper right")
+
+        axes[1, col].step(trials, result.actions, where="mid")
+        axes[1, col].set_ylabel("Action")
+        axes[1, col].set_yticks([0, 1])
+
+        axes[2, col].step(trials, optimal_arms, where="mid", color="black")
+        axes[2, col].set_ylabel("Optimal arm")
+        axes[2, col].set_yticks([0, 1])
+
+        axes[3, col].step(trials, result.rewards, where="mid", color="green")
+        axes[3, col].set_ylabel("Reward")
+        axes[3, col].set_yticks([0, 1])
+        axes[3, col].set_xlabel("Trial")
+
+    fig1.suptitle(
+        "Figure 1: Time series of action values, actions, optimal arms, and rewards"
+    )
+    fig1.tight_layout(rect=[0, 0, 1, 0.97])
+
+    alpha_values = list(alphas)
+    beta_values = list(betas)
+    alpha_indices = {value: idx for idx, value in enumerate(alpha_values)}
+    beta_indices = {value: idx for idx, value in enumerate(beta_values)}
+    log_like_grid = [
+        [float("nan")] * len(alpha_values) for _ in range(len(beta_values))
+    ]
+    for alpha, beta, log_like, _, _ in evaluations:
+        row = beta_indices[beta]
+        col = alpha_indices[alpha]
+        log_like_grid[row][col] = log_like
+
+    fig2, ax2 = plt.subplots(figsize=(8, 6))
+    alpha_step = alpha_values[1] - alpha_values[0] if len(alpha_values) > 1 else 1.0
+    beta_step = beta_values[1] - beta_values[0] if len(beta_values) > 1 else 1.0
+    extent = [
+        alpha_values[0] - alpha_step / 2,
+        alpha_values[-1] + alpha_step / 2,
+        beta_values[0] - beta_step / 2,
+        beta_values[-1] + beta_step / 2,
+    ]
+    c = ax2.imshow(
+        log_like_grid,
+        origin="lower",
+        aspect="auto",
+        extent=extent,
+        cmap="viridis",
+    )
+    ax2.scatter([best_alpha], [best_beta], color="red", marker="x", s=100, label="Best")
+    ax2.set_xlabel("alpha")
+    ax2.set_ylabel("beta")
+    ax2.set_xticks(alpha_values)
+    ax2.set_yticks(beta_values)
+    ax2.set_title("Figure 2: Log-likelihood surface")
+    ax2.legend(loc="upper left")
+    fig2.colorbar(c, ax=ax2, label="Log-likelihood")
+    fig2.tight_layout()
+
+    plt.show()
 
 
 if __name__ == "__main__":
